@@ -2,13 +2,20 @@
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 using Microsoft.Win32;
 using UnityEditor;
+using UnityEditor.WindowsStandalone;
 using UnityEngine;
+using UnityEngine.Events;
 using Debug = UnityEngine.Debug;
 
 namespace HoloToolkit.Unity
@@ -129,66 +136,124 @@ namespace HoloToolkit.Unity
             return buildSuccess;
         }
 
+        static Boo.Lang.List<string> output = new Boo.Lang.List<string>();
+
+        private static bool isExit = false;
+
         public static string CalcMSBuildPath(string msBuildVersion)
         {
-            if (msBuildVersion.Equals("14.0"))
+            // Finding msbuild.exe involves different work depending on whether or not users
+            // have VS2017 or VS2019 installed.
+            foreach (VSWhereFindOption findOption in VSWhereFindOptions)
             {
-                using (RegistryKey key =
-                    Registry.LocalMachine.OpenSubKey(
-                        string.Format(@"Software\Microsoft\MSBuild\ToolsVersions\{0}", msBuildVersion)))
+                string arguments = findOption.arguments;
+                if (string.IsNullOrWhiteSpace(EditorUserBuildSettings.wsaUWPVisualStudioVersion))
                 {
-                    if (key != null)
+                    arguments += " -latest";
+                }
+                else
+                {
+                    // Add version number with brackets to find only the specified version
+                    arguments += $" -version [1,{EditorUserBuildSettings.wsaUWPVisualStudioVersion}]";
+                }
+
+                using (var proc = new Process())
+                using (var ctoken = new CancellationTokenSource())
+                {
+                    proc.EnableRaisingEvents = true;
+                    proc.StartInfo =
+                        new ProcessStartInfo
+                        {
+                            FileName = "cmd.exe",
+                            CreateNoWindow = true,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            Arguments = arguments,
+                            WorkingDirectory = @"C:\Program Files (x86)\Microsoft Visual Studio\Installer"
+                        };
+                    output.Clear();
+
+                    proc.OutputDataReceived += (sender, args) =>
                     {
-                        var msBuildBinFolder = (string)key.GetValue("MSBuildToolsPath");
-                        return Path.Combine(msBuildBinFolder, "msbuild.exe");
+                        if (args.Data != null)
+                        {
+                            output.Add(args.Data);
+                        }
+                    };
+
+                    proc.Exited += (sender, args) => { ctoken.Cancel(); };
+                    proc.Start();
+                    proc.BeginOutputReadLine();
+                    ctoken.Token.WaitHandle.WaitOne();
+                    proc.WaitForExit();
+
+                    foreach (var path in output)
+                    {
+                        if (!string.IsNullOrEmpty(path))
+                        {
+                            string[] paths = path.Split(new[] {Environment.NewLine},
+                                StringSplitOptions.RemoveEmptyEntries);
+
+                            if (paths.Length > 0)
+                            {
+                                // if there are multiple visual studio installs,
+                                // prefer enterprise, then pro, then community
+                                string bestPath = paths.OrderByDescending(p => p.ToLower().Contains("enterprise"))
+                                    .ThenByDescending(p => p.ToLower().Contains("professional"))
+                                    .ThenByDescending(p => p.ToLower().Contains("community")).First();
+
+                                string finalPath = $@"{bestPath}{findOption.pathSuffix}";
+                                if (File.Exists(finalPath))
+                                {
+                                    return finalPath;
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            // If we got this far then we don't have VS 2015 installed and need to use msBuild 15
-            msBuildVersion = "15.0";
-
-            // For MSBuild 15+ we should to use vswhere to give us the correct instance
-            string output = @"/C vswhere -version " + msBuildVersion + " -products * -requires Microsoft.Component.MSBuild -property installationPath";
-
-            // get the right program files path based on whether the PC is x86 or x64
-            string programFiles = @"C:\Program Files (x86)\Microsoft Visual Studio\Installer";
-
-            var vswherePInfo = new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = false,
-                Arguments = output,
-                WorkingDirectory = programFiles
-            };
-
-            using (var vswhereP = new Process())
-            {
-                vswhereP.StartInfo = vswherePInfo;
-                vswhereP.Start();
-                output = vswhereP.StandardOutput.ReadToEnd();
-                vswhereP.WaitForExit();
-            }
-
-            string[] paths = output.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
-
-            if (paths.Length > 0)
-            {
-                // if there are multiple 2017 installs,
-                // prefer enterprise, then pro, then community
-                string bestPath = paths.OrderBy(p => p.ToLower().Contains("enterprise"))
-                                        .ThenBy(p => p.ToLower().Contains("professional"))
-                                        .ThenBy(p => p.ToLower().Contains("community")).First();
-
-                return bestPath + @"\MSBuild\" + msBuildVersion + @"\Bin\MSBuild.exe";
-            }
-
             Debug.LogError("Unable to find a valid path to Visual Studio Instance!");
             return string.Empty;
         }
+
+        /// <summary>
+        /// This struct controls the behavior of the arguments that are used
+        /// when finding msbuild.exe.
+        /// </summary>
+        private struct VSWhereFindOption
+        {
+            public VSWhereFindOption(string args, string suffix)
+            {
+                arguments = args;
+                pathSuffix = suffix;
+            }
+
+            /// <summary>
+            /// Used to populate the Arguments of ProcessStartInfo when invoking
+            /// vswhere.
+            /// </summary>
+            public string arguments;
+
+            /// <summary>
+            /// This string is added as a suffix to the result of the vswhere path
+            /// search.
+            /// </summary>
+            public string pathSuffix;
+        }
+
+        private static readonly VSWhereFindOption[] VSWhereFindOptions =
+        {
+            // This find option corresponds to the version of vswhere that ships with VS2019.
+            new VSWhereFindOption(
+                @"/C vswhere -all -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe",
+                ""),
+            // This find option corresponds to the version of vswhere that ships with VS2017 - this doesn't have
+            // support for the -find command switch.
+            new VSWhereFindOption(
+                @"/C vswhere -all -products * -requires Microsoft.Component.MSBuild -property installationPath",
+                "\\MSBuild\\15.0\\Bin\\MSBuild.exe"),
+        };
 
         public static bool RestoreNugetPackages(string nugetPath, string storePath)
         {
@@ -215,7 +280,9 @@ namespace HoloToolkit.Unity
             return File.Exists(storePath + "\\project.lock.json");
         }
 
-        public static bool BuildAppxFromSLN(string productName, string msBuildVersion, bool forceRebuildAppx, string buildConfig, string buildPlatform, string buildDirectory, bool incrementVersion, bool showDialog = true)
+        public static Queue<UnityAction> Stacks = new Queue<UnityAction>();
+
+        public static Task<bool> BuildAppxFromSLN(string productName, string msBuildVersion, bool forceRebuildAppx, string buildConfig, string buildPlatform, string buildDirectory, bool incrementVersion, bool showDialog = true)
         {
             EditorUtility.DisplayProgressBar("Build AppX", "Building AppX Package...", 0);
             string slnFilename = Path.Combine(buildDirectory, PlayerSettings.productName + ".sln");
@@ -224,7 +291,7 @@ namespace HoloToolkit.Unity
             {
                 Debug.LogError("Unable to find Solution to build from!");
                 EditorUtility.ClearProgressBar();
-                return false;
+                return Task.FromResult(false);
             }
 
             // Get and validate the msBuild path...
@@ -234,7 +301,7 @@ namespace HoloToolkit.Unity
             {
                 Debug.LogErrorFormat("MSBuild.exe is missing or invalid:\n{0}.", msBuildPath);
                 EditorUtility.ClearProgressBar();
-                return false;
+                return Task.FromResult(false);
             }
 
             // Get the path to the NuGet tool
@@ -243,28 +310,28 @@ namespace HoloToolkit.Unity
             string storePath = Path.GetFullPath(Path.Combine(Path.Combine(Application.dataPath, ".."), buildDirectory));
             string solutionProjectPath = Path.GetFullPath(Path.Combine(storePath, productName + @".sln"));
 
-            // Bug in Unity editor that doesn't copy project.json and project.lock.json files correctly if solutionProjectPath is not in a folder named UWP.
-            if (!File.Exists(storePath + "\\project.json"))
-            {
-                File.Copy(unity + @"\Data\PlaybackEngines\MetroSupport\Tools\project.json", storePath + "\\project.json");
-            }
+            //// Bug in Unity editor that doesn't copy project.json and project.lock.json files correctly if solutionProjectPath is not in a folder named UWP.
+            //if (!File.Exists(storePath + "\\project.json"))
+            //{
+            //    File.Copy(unity + @"\Data\PlaybackEngines\MetroSupport\Tools\project.json", storePath + "\\project.json");
+            //}
 
-            string assemblyCSharp = string.Format("{0}/GeneratedProjects/UWP/Assembly-CSharp", storePath);
-            string assemblyCSharpFirstPass = string.Format("{0}/GeneratedProjects/UWP/Assembly-CSharp-firstpass", storePath);
-            bool restoreFirstPass = Directory.Exists(assemblyCSharpFirstPass);
-            string nugetPath = Path.Combine(unity, @"Data\PlaybackEngines\MetroSupport\Tools\NuGet.exe");
+            //string assemblyCSharp = string.Format("{0}/GeneratedProjects/UWP/Assembly-CSharp", storePath);
+            //string assemblyCSharpFirstPass = string.Format("{0}/GeneratedProjects/UWP/Assembly-CSharp-firstpass", storePath);
+            //bool restoreFirstPass = Directory.Exists(assemblyCSharpFirstPass);
+            //string nugetPath = Path.Combine(unity, @"Data\PlaybackEngines\MetroSupport\Tools\NuGet.exe");
 
-            // Before building, need to run a nuget restore to generate a json.lock file. Failing to do this breaks the build in VS RTM
-            if (PlayerSettings.GetScriptingBackend(BuildTargetGroup.WSA) == ScriptingImplementation.WinRTDotNET &&
-                (!RestoreNugetPackages(nugetPath, storePath) ||
-                 !RestoreNugetPackages(nugetPath, storePath + "\\" + productName) ||
-                 EditorUserBuildSettings.wsaGenerateReferenceProjects && !RestoreNugetPackages(nugetPath, assemblyCSharp) ||
-                 EditorUserBuildSettings.wsaGenerateReferenceProjects && restoreFirstPass && !RestoreNugetPackages(nugetPath, assemblyCSharpFirstPass)))
-            {
-                Debug.LogError("Failed to restore nuget packages");
-                EditorUtility.ClearProgressBar();
-                return false;
-            }
+            //// Before building, need to run a nuget restore to generate a json.lock file. Failing to do this breaks the build in VS RTM
+            //if (PlayerSettings.GetScriptingBackend(BuildTargetGroup.WSA) == ScriptingImplementation.WinRTDotNET &&
+            //    (!RestoreNugetPackages(nugetPath, storePath) ||
+            //     !RestoreNugetPackages(nugetPath, storePath + "\\" + productName) ||
+            //     EditorUserBuildSettings.wsaGenerateReferenceProjects && !RestoreNugetPackages(nugetPath, assemblyCSharp) ||
+            //     EditorUserBuildSettings.wsaGenerateReferenceProjects && restoreFirstPass && !RestoreNugetPackages(nugetPath, assemblyCSharpFirstPass)))
+            //{
+            //    Debug.LogError("Failed to restore nuget packages");
+            //    EditorUtility.ClearProgressBar();
+            //    return false;
+            //}
 
             EditorUtility.DisplayProgressBar("Build AppX", "Building AppX Package...", 25);
 
@@ -273,7 +340,7 @@ namespace HoloToolkit.Unity
             {
                 Debug.LogError("Failed to increment package version!");
                 EditorUtility.ClearProgressBar();
-                return false;
+                return Task.FromResult(false);
             }
 
             // Now do the actual build
@@ -297,69 +364,94 @@ namespace HoloToolkit.Unity
                 EnableRaisingEvents = true
             };
 
-            try
+            return Task.Run<bool>((() =>
             {
-                process.ErrorDataReceived += (sender, args) =>
+                try
                 {
-                    if (!string.IsNullOrEmpty(args.Data))
+                    process.ErrorDataReceived += (sender, args) =>
                     {
-                        Debug.LogError(args.Data);
-                    }
-                };
+                        if (!string.IsNullOrEmpty(args.Data))
+                        {
+                            Debug.LogError(args.Data);
+                        }
+                    };
 
-                process.OutputDataReceived += (sender, args) =>
-                {
-                    if (!string.IsNullOrEmpty(args.Data))
+                    process.OutputDataReceived += (sender, args) =>
                     {
-                        Debug.Log(args.Data);
-                    }
-                };
+                        if (!string.IsNullOrEmpty(args.Data))
+                        {
+                            Debug.Log(args.Data);
+                        }
+                    };
 
-                if (!process.Start())
-                {
-                    Debug.LogError("Failed to start process!");
-                    EditorUtility.ClearProgressBar();
+                    if (!process.Start())
+                    {
+                        Stacks.Enqueue(() =>
+                        {
+                            Debug.LogError("Failed to start process!");
+                            EditorUtility.ClearProgressBar();
+                        });
+                        process.Close();
+                        process.Dispose();
+                        return false;
+                    }
+
+                    process.BeginOutputReadLine();
+                    process.BeginErrorReadLine();
+                    process.WaitForExit();
+
+                    if (process.ExitCode == 0)
+                    {
+                        Stacks.Enqueue(() =>
+                            {
+                                EditorUtility.ClearProgressBar();
+
+                                if ( showDialog &&
+                                    !EditorUtility.DisplayDialog("Build AppX", "AppX Build Successful!", "OK",
+                                        "Open AppX Folder"))
+                                {
+
+                                    Process.Start("explorer.exe",
+                                        string.Format("/f /open,{0}\\AppPackages\\{1}",
+                                            Path.GetFullPath(BuildDeployPrefs.BuildDirectory), PlayerSettings.productName));
+                                    Debug.Log(string.Format("/f /open,{0}\\AppPackages\\{1}",
+                                        Path.GetFullPath(BuildDeployPrefs.BuildDirectory), PlayerSettings.productName));
+                                }
+                            }
+                        );
+                    }
+                    else
+                    {
+                        var code = process.ExitCode;
+                        Stacks.Enqueue(() =>
+                        {
+                            Debug.LogError(string.Format("MSBuild error (code = {0})", code));
+                            EditorUtility.ClearProgressBar();
+                            EditorUtility.DisplayDialog(PlayerSettings.productName + " build Failed!",
+                                "Failed to build appx from solution. Error code: " + code, "OK");
+                        });
+
+                        process.Close();
+                        process.Dispose();
+                        return false;
+                    }
+
                     process.Close();
                     process.Dispose();
-                    return false;
                 }
-
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-                process.WaitForExit();
-
-                EditorUtility.ClearProgressBar();
-
-                if (process.ExitCode == 0 && showDialog &&
-                    !EditorUtility.DisplayDialog("Build AppX", "AppX Build Successful!", "OK", "Open AppX Folder"))
+                catch (Exception e)
                 {
-                    Process.Start("explorer.exe", string.Format("/f /open,{0}/{1}/AppPackages", Path.GetFullPath(BuildDeployPrefs.BuildDirectory), PlayerSettings.productName));
-                }
-
-                if (process.ExitCode != 0)
-                {
-                    Debug.LogError(string.Format("MSBuild error (code = {0})", process.ExitCode));
-                    EditorUtility.ClearProgressBar();
-                    EditorUtility.DisplayDialog(PlayerSettings.productName + " build Failed!", "Failed to build appx from solution. Error code: " + process.ExitCode, "OK");
-
                     process.Close();
                     process.Dispose();
+                    Stacks.Enqueue(() =>
+                    {
+                        Debug.LogError("Cmd Process EXCEPTION: " + e);
+                        EditorUtility.ClearProgressBar();
+                    });
                     return false;
                 }
-
-                process.Close();
-                process.Dispose();
-            }
-            catch (Exception e)
-            {
-                process.Close();
-                process.Dispose();
-                Debug.LogError("Cmd Process EXCEPTION: " + e);
-                EditorUtility.ClearProgressBar();
-                return false;
-            }
-
-            return true;
+                return true;
+            }));
         }
 
         private static bool SetPackageVersion(bool increment)

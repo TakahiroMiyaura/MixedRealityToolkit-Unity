@@ -117,13 +117,6 @@ namespace HoloToolkit.Unity
                 EditorUserBuildSettings.wsaUWPBuildType = buildInfo.WSAUWPBuildType.Value;
             }
 
-            var oldWSAGenerateReferenceProjects = EditorUserBuildSettings.wsaGenerateReferenceProjects;
-
-            if (buildInfo.WSAGenerateReferenceProjects.HasValue)
-            {
-                EditorUserBuildSettings.wsaGenerateReferenceProjects = buildInfo.WSAGenerateReferenceProjects.Value;
-            }
-
             var oldColorSpace = PlayerSettings.colorSpace;
 
             if (buildInfo.ColorSpace.HasValue)
@@ -177,7 +170,7 @@ namespace HoloToolkit.Unity
             {
                 OnPostProcessBuild(buildInfo, buildReport);
 
-                if (buildInfo.BuildTarget == BuildTarget.WSAPlayer && EditorUserBuildSettings.wsaGenerateReferenceProjects)
+                if (buildInfo.BuildTarget == BuildTarget.WSAPlayer)
                 {
                     UwpProjectPostProcess.Execute(buildInfo.OutputDirectory);
                 }
@@ -187,7 +180,7 @@ namespace HoloToolkit.Unity
 
                 EditorUserBuildSettings.wsaUWPBuildType = oldWSAUWPBuildType.Value;
 
-                EditorUserBuildSettings.wsaGenerateReferenceProjects = oldWSAGenerateReferenceProjects;
+                //EditorUserBuildSettings.wsaGenerateReferenceProjects = oldWSAGenerateReferenceProjects;
                 EditorUserBuildSettings.SwitchActiveBuildTarget(oldBuildTargetGroup, oldBuildTarget);
             }
         }

@@ -21,8 +21,10 @@ namespace HoloToolkit.Unity
     {
         private const float UpdateBuildsPeriod = 1.0f;
 
-        private const string SdkVersion =
-#if UNITY_2017_2_OR_NEWER
+        private const string SdkVersion = 
+#if UNITY_2019_1_OR_NEWER
+                "10.0.18362.0";
+#elif UNITY_2017_2_OR_NEWER
                 "10.0.17134.0";
 #else
                 "10.0.15063.0";
@@ -80,7 +82,11 @@ namespace HoloToolkit.Unity
         private enum BuildPlatformEnum
         {
             x86 = 1,
-            x64 = 2
+            x64 = 2,
+            arm = 4,
+#if UNITY_2019_1_OR_NEWER
+            arm64 =8
+#endif
         }
 
         private enum BuildConfigEnum
@@ -319,6 +325,11 @@ namespace HoloToolkit.Unity
             {
                 UpdateBuilds();
             }
+
+            while (BuildDeployTools.Stacks.Count > 0)
+            {
+                BuildDeployTools.Stacks.Dequeue().Invoke();
+            }
         }
 
         private void UnityBuildGUI()
@@ -377,17 +388,6 @@ namespace HoloToolkit.Unity
 
             // Generate C# Project References for debugging
             GUILayout.FlexibleSpace();
-            var previousLabelWidth = EditorGUIUtility.labelWidth;
-            EditorGUIUtility.labelWidth = 105;
-            bool generateReferenceProjects = EditorUserBuildSettings.wsaGenerateReferenceProjects;
-            bool shouldGenerateProjects = EditorGUILayout.Toggle(useCSharpProjectsLabel, generateReferenceProjects);
-
-            if (shouldGenerateProjects != generateReferenceProjects)
-            {
-                EditorUserBuildSettings.wsaGenerateReferenceProjects = shouldGenerateProjects;
-            }
-
-            EditorGUIUtility.labelWidth = previousLabelWidth;
 
             // Build Unity Player
             GUI.enabled = ShouldBuildSLNBeEnabled;
@@ -539,6 +539,14 @@ namespace HoloToolkit.Unity
             {
                 buildPlatformOption = BuildPlatformEnum.x64;
             }
+            else if (curBuildPlatformString.ToLower().Equals("arm"))
+            {
+                buildPlatformOption = BuildPlatformEnum.arm;
+            }
+            else if (curBuildPlatformString.ToLower().Equals("arm64"))
+            {
+                buildPlatformOption = BuildPlatformEnum.arm64;
+            }
 
             buildPlatformOption = (BuildPlatformEnum)EditorGUILayout.EnumPopup("Build Platform", buildPlatformOption, GUILayout.Width(halfWidth));
 
@@ -548,6 +556,8 @@ namespace HoloToolkit.Unity
             {
                 case BuildPlatformEnum.x86:
                 case BuildPlatformEnum.x64:
+                case BuildPlatformEnum.arm:
+                case BuildPlatformEnum.arm64:
                     newBuildPlatformString = buildPlatformOption.ToString();
                     break;
                 default:
@@ -1039,7 +1049,7 @@ namespace HoloToolkit.Unity
             }
 
             // Next, APPX
-            if (!BuildDeployTools.BuildAppxFromSLN(
+            BuildDeployTools.BuildAppxFromSLN(
                 PlayerSettings.productName,
                 BuildDeployPrefs.MsBuildVersion,
                 BuildDeployPrefs.ForceRebuild,
@@ -1047,25 +1057,27 @@ namespace HoloToolkit.Unity
                 BuildDeployPrefs.BuildPlatform,
                 BuildDeployPrefs.BuildDirectory,
                 BuildDeployPrefs.IncrementBuildVersion,
-                showDialog: !install))
+                showDialog: !install).ContinueWith((task =>
             {
-                return;
-            }
-
-            // Next, Install
-            if (install)
-            {
-                string fullBuildLocation = CalcMostRecentBuild();
-
-                if (BuildDeployPrefs.TargetAllConnections)
+                if (!task.Result)
                 {
-                    InstallAppOnDevicesList(fullBuildLocation, portalConnections);
+                    return;
                 }
-                else
+                // Next, Install
+                if (install)
                 {
-                    InstallOnTargetDevice(fullBuildLocation, portalConnections.Connections[currentConnectionInfoIndex]);
+                    string fullBuildLocation = CalcMostRecentBuild();
+
+                    if (BuildDeployPrefs.TargetAllConnections)
+                    {
+                        InstallAppOnDevicesList(fullBuildLocation, portalConnections);
+                    }
+                    else
+                    {
+                        InstallOnTargetDevice(fullBuildLocation, portalConnections.Connections[currentConnectionInfoIndex]);
+                    }
                 }
-            }
+            }));
         }
 
         private void UpdateBuilds()
